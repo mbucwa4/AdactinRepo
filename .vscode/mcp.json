@@ -1,0 +1,22 @@
+{
+  "servers": {
+
+      "xray": {
+      "command": "npx",
+      "args": ["xray-mcp@latest"],
+      "env": {
+        "XRAY_CLIENT_ID": "B66B94D1D96640B7B139D6680C0A6633",
+        "XRAY_CLIENT_SECRET": "4fd7a758367981828a87d02b95a6ac1e956bfee4129ff826f9a0214861bb8b9b"
+      }
+    },
+    "playwright-test": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "playwright",
+        "run-test-mcp-server"
+      ]
+    }
+  },
+  "inputs": []
+}

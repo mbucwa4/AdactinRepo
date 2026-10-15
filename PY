@@ -1,0 +1,21 @@
+)" && if ')itp = Path('.env')
+value = ''
+if p.exists():
+    for line in p.read_text().splitlines():
+        s = line.strip()
+        if s.startxqp = Path('.env')
+value evvalue = ''
+if pntif p.exis\n    for line re        s = line.strip()
+        if s.starho        if s.startswithgn            value = s.split('=', 1)[-             break
+print(value)
+PY
+)" && if [ -n "${GH_TOKEN:-}" ]; p/print(value)
+PY
+>&PY
+)" && if ')itp = Path('.env')
+value = ''
+if p.exists():
+    for line in p.read_text().splitlines():
+        s = line.strip()
+        if s.startxqp = Path('.env')
+value evvalue = ''
