@@ -1,0 +1,104 @@
+name: Playwright Xray Import
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_exec_key:
+        description: Existing Xray Test Execution key to import results into
+        required: true
+        default: ILABACCEL-1614
+        type: string
+
+jobs:
+  playwright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run Playwright tests
+        run: npx playwright test
+
+      - name: Upload HTML report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-html-report
+          path: playwright-report/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload JUnit Xray report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-junit-report
+          path: results/xray-report.xml
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Validate Xray secrets
+        if: ${{ always() }}
+        env:
+          XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
+          XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          [ -n "${XRAY_CLIENT_ID:-}" ]
+          [ -n "${XRAY_CLIENT_SECRET:-}" ]
+
+      - name: Import JUnit results to Xray
+        if: ${{ always() }}
+        env:
+          XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
+          XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
+          TEST_EXEC_KEY: ${{ inputs.test_exec_key }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${XRAY_CLIENT_ID:-}" ] || [ -z "${XRAY_CLIENT_SECRET:-}" ]; then
+            echo "Missing required Xray secrets." >&2
+            exit 1
+          fi
+
+          if [ ! -f "results/xray-report.xml" ]; then
+            echo "JUnit XML file missing." >&2
+            exit 1
+          fi
+
+          token="$(curl -sS --fail --location --request POST \
+            "https://xray.cloud.getxray.app/api/v2/authenticate" \
+            --header "Content-Type: application/json" \
+            --data "{\"client_id\":\"${XRAY_CLIENT_ID}\",\"client_secret\":\"${XRAY_CLIENT_SECRET}\"}" \
+            | tr -d '\r\n\"')"
+
+          if [ -z "${token:-}" ]; then
+            echo "Xray authentication failed; no token was returned." >&2
+            exit 1
+          fi
+
+          response="$(curl -sS --fail --location --request POST \
+            --header "Authorization: Bearer ${token}" \
+            -F "file=@results/xray-report.xml" \
+            "https://xray.cloud.getxray.app/api/v2/import/execution/junit?projectKey=ILABACCEL&testExecKey=${TEST_EXEC_KEY}")"
+
+          if ! printf '%s' "${response}" | jq -e '(.error == null or (.error|tostring) == "" or .success == true or .status == "success" or .testExecKey != null or .key != null)' >/dev/null 2>&1; then
+            echo "Xray import rejected." >&2
+            exit 1
+          fi
+
+          echo "Xray import succeeded."
