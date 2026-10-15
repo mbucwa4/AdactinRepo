@@ -37,11 +37,9 @@ jobs:
         id: playwright
         env:
           CI: true
-          PLAYWRIGHT_JUNIT_OUTPUT_DIR: results
-          PLAYWRIGHT_JUNIT_OUTPUT_NAME: xray-report.xml
         run: |
           mkdir -p results
-          npx playwright test --reporter=list --reporter=json --reporter=html --reporter=junit
+          npx playwright test --reporter=list --reporter=json --reporter=html
         continue-on-error: true
 
       - name: Upload HTML report artifact
@@ -53,12 +51,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Upload JUnit report artifact
+      - name: Upload Playwright JSON artifact
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-xray-junit
-          path: results/xray-report.xml
+          name: playwright-results-json
+          path: results/results.json
           if-no-files-found: error
           retention-days: 30
 
@@ -76,6 +74,70 @@ jobs:
             exit 1
           fi
 
+      - name: Convert Playwright JSON results to JUnit XML for Xray
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f results/results.json ]; then
+            echo "results/results.json is missing" >&2
+            exit 1
+          fi
+
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const reportPath = path.join(process.cwd(), 'results', 'results.json');
+          const xmlPath = path.join(process.cwd(), 'results', 'xray-import.xml');
+          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+
+          const cases = [];
+
+          function collectSuites(suites) {
+            for (const suite of suites || []) {
+              if (suite.specs) {
+                for (const spec of suite.specs) {
+                  if (!spec.tests) continue;
+                  for (const test of spec.tests) {
+                    const results = test.results || [];
+                    const lastResult = results[results.length - 1] || {};
+                    const annotations = [...(test.annotations || []), ...(results.flatMap(r => r.annotations || []))];
+                    const xrayKey = (annotations.find(a => a.description && /^ILABACCEL-\d+$/.test(a.description)) || {}).description || '';
+                    const title = spec.title || test.title || xrayKey || 'unnamed-test';
+                    const failed = ['failed', 'timedOut', 'interrupted', 'unexpected'].includes((lastResult.status || '').toLowerCase());
+                    const message = ((lastResult.errors || []).map(e => e.message || e || 'Test failed').join('\n') || (failed ? 'Test failed' : ''));
+                    cases.push({ title, xrayKey, failed, message });
+                  }
+                }
+              }
+              collectSuites(suite.suites);
+            }
+          }
+
+          collectSuites(report.suites || []);
+
+          const total = cases.length;
+          const failedCount = cases.filter(c => c.failed).length;
+          const xml = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            `<testsuites tests="${total}" failures="${failedCount}" time="0">`,
+            `<testsuite name="playwright" tests="${total}" failures="${failedCount}" errors="0" skipped="0" time="0">`,
+            ...cases.map(c => {
+              const name = c.title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+              const classname = (c.xrayKey || 'playwright').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+              const failureXml = c.failed
+                ? `<failure message="${(c.message || 'Test failed').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;')}">${(c.message || 'Test failed').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</failure>`
+                : '';
+              return `<testcase classname="${classname}" name="${name}" time="0">${failureXml}</testcase>`;
+            }),
+            '</testsuite>',
+            '</testsuites>'
+          ].join('\n');
+
+          fs.writeFileSync(xmlPath, xml);
+          NODE
+
       - name: Import results into existing Xray execution
         if: ${{ always() }}
         shell: bash
@@ -89,8 +151,8 @@ jobs:
             exit 1
           fi
 
-          if [ ! -f results/xray-report.xml ]; then
-            echo "results/xray-report.xml is missing" >&2
+          if [ ! -f results/xray-import.xml ]; then
+            echo "results/xray-import.xml is missing" >&2
             exit 1
           fi
 
@@ -108,7 +170,7 @@ jobs:
           HTTP_STATUS="$(curl -sS --max-time 60 -o /tmp/xray-import-response.json -w '%{http_code}' \
             -X POST \
             -H "Authorization: Bearer ${XRAY_TOKEN}" \
-            -F "file=@results/xray-report.xml" \
+            -F "file=@results/xray-import.xml" \
             "https://xray.cloud.getxray.app/api/v2/import/execution/junit?projectKey=ILABACCEL&testExecKey=${TEST_EXEC_KEY}")"
 
           if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ] && [ "$HTTP_STATUS" != "202" ]; then
