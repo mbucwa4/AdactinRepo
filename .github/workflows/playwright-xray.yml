@@ -10,19 +10,22 @@ on:
         type: string
 
 jobs:
-  playwright:
+  playwright-xray:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
+      XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
 
     steps:
-      - name: Check out repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       - name: Install dependencies
         run: npm ci
@@ -30,75 +33,92 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps
 
-      - name: Run Playwright tests
-        run: npx playwright test
+      - name: Run Playwright suite
+        id: playwright
+        env:
+          CI: true
+          PLAYWRIGHT_JUNIT_OUTPUT_DIR: results
+          PLAYWRIGHT_JUNIT_OUTPUT_NAME: xray-report.xml
+        run: |
+          mkdir -p results
+          npx playwright test --reporter=list --reporter=json --reporter=html --reporter=junit
+        continue-on-error: true
 
-      - name: Upload HTML report
-        if: ${{ always() }}
+      - name: Upload HTML report artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: playwright-html-report
           path: playwright-report/
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 30
 
-      - name: Upload JUnit Xray report
-        if: ${{ always() }}
+      - name: Upload JUnit report artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: xray-junit-report
+          name: playwright-xray-junit
           path: results/xray-report.xml
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
 
       - name: Validate Xray secrets
         if: ${{ always() }}
-        env:
-          XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
-          XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
+        shell: bash
         run: |
           set -euo pipefail
-          [ -n "${XRAY_CLIENT_ID:-}" ]
-          [ -n "${XRAY_CLIENT_SECRET:-}" ]
+          if [ -z "${XRAY_CLIENT_ID:-}" ]; then
+            echo "XRAY_CLIENT_ID is empty" >&2
+            exit 1
+          fi
+          if [ -z "${XRAY_CLIENT_SECRET:-}" ]; then
+            echo "XRAY_CLIENT_SECRET is empty" >&2
+            exit 1
+          fi
 
-      - name: Import JUnit results to Xray
+      - name: Import results into existing Xray execution
         if: ${{ always() }}
+        shell: bash
         env:
-          XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
-          XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
-          TEST_EXEC_KEY: ${{ inputs.test_exec_key }}
+          TEST_EXEC_KEY: ${{ github.event.inputs.test_exec_key }}
         run: |
           set -euo pipefail
 
-          if [ -z "${XRAY_CLIENT_ID:-}" ] || [ -z "${XRAY_CLIENT_SECRET:-}" ]; then
-            echo "Missing required Xray secrets." >&2
+          if [ -z "${TEST_EXEC_KEY:-}" ]; then
+            echo "test_exec_key input is empty" >&2
             exit 1
           fi
 
-          if [ ! -f "results/xray-report.xml" ]; then
-            echo "JUnit XML file missing." >&2
+          if [ ! -f results/xray-report.xml ]; then
+            echo "results/xray-report.xml is missing" >&2
             exit 1
           fi
 
-          token="$(curl -sS --fail --location --request POST \
-            "https://xray.cloud.getxray.app/api/v2/authenticate" \
-            --header "Content-Type: application/json" \
-            --data "{\"client_id\":\"${XRAY_CLIENT_ID}\",\"client_secret\":\"${XRAY_CLIENT_SECRET}\"}" \
-            | tr -d '\r\n\"')"
+          AUTH_RESPONSE="$(curl -sS --max-time 30 -X POST "https://xray.cloud.getxray.app/api/v2/authenticate" \
+            -H "Content-Type: application/json" \
+            --data "{\"client_id\":\"${XRAY_CLIENT_ID}\",\"client_secret\":\"${XRAY_CLIENT_SECRET}\"}")"
 
-          if [ -z "${token:-}" ]; then
-            echo "Xray authentication failed; no token was returned." >&2
+          XRAY_TOKEN="$(printf '%s' "$AUTH_RESPONSE" | tr -d '\r\n' | sed 's/^"//; s/"$//; s/\\"/"/g')"
+
+          if [ -z "$XRAY_TOKEN" ]; then
+            echo "Xray authentication failed: no token returned" >&2
             exit 1
           fi
 
-          response="$(curl -sS --fail --location --request POST \
-            --header "Authorization: Bearer ${token}" \
+          HTTP_STATUS="$(curl -sS --max-time 60 -o /tmp/xray-import-response.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${XRAY_TOKEN}" \
             -F "file=@results/xray-report.xml" \
             "https://xray.cloud.getxray.app/api/v2/import/execution/junit?projectKey=ILABACCEL&testExecKey=${TEST_EXEC_KEY}")"
 
-          if ! printf '%s' "${response}" | jq -e '(.error == null or (.error|tostring) == "" or .success == true or .status == "success" or .testExecKey != null or .key != null)' >/dev/null 2>&1; then
-            echo "Xray import rejected." >&2
+          if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ] && [ "$HTTP_STATUS" != "202" ]; then
+            echo "Xray import rejected" >&2
             exit 1
           fi
 
-          echo "Xray import succeeded."
+      - name: Fail if Playwright failed
+        if: ${{ always() }}
+        run: |
+          if [ "${{ steps.playwright.outcome }}" = "failure" ]; then
+            exit 1
+          fi
